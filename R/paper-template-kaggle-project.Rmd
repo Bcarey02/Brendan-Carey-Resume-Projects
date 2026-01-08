@@ -1,0 +1,489 @@
+---
+title: "Beating the Board: Season Value vs. ADP in PPR Fantasy Football (2017–2023)"
+author:
+  - name: Brendan Carey
+    email: bcarey02@manhattan.edu
+    major: Computer Information Systems
+    affiliation: Manhattan University
+    footnote: 1
+address:
+  - code: Manhattan University
+    address: O'Malley School of Business, Riverdale, NY 10471
+footnote:
+  - code: 1
+    text: "Corresponding Author"
+abstract: |
+  A project workflow is proposed. Included are an introduction with the key questions posed for analysis, exploratory data analysis, causal inference, and concluding discussion.
+keywords: Project Report; Workflow; Exploratory Data Analysis; Causal Inference; Probabilistic Reasoning; WAIC; PSIS; Counterfactual Inference
+date: "`r Sys.Date()`"
+bibliography: refs.bib
+biblio-style: apalike
+link-citations: yes
+#linenumbers: true
+numbersections: true
+longtable: true
+output: 
+  bookdown::html_document2:
+    fig_caption: yes
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, eval = TRUE, message = FALSE, warning = FALSE)
+library(rethinking)
+library(tidyverse)
+library(plotly)
+library(tidybayes)
+library(tidybayes.rethinking)
+library(ggdag)
+library(GGally)
+library(ggrepel)
+library(ggridges)
+library(cowplot)
+```
+
+# Introduction
+
+-   Fantasy football gives fans a way to act like real team managers by drafting players, tracking weekly performance, and competing based on how those players perform in actual NFL games. Every summer, thousands of fantasy managers rely on Average Draft Position (ADP) data to decide which players are worth early round picks and which might be hidden bargains. Yet, season after season, some players perform far better than expected while others fall short.
+
+-   This project analyzes fantasy football data from 2017 through 2022 to understand which players, positions, and draft ranges most consistently outperform their ADP in points-per-reception (PPR) scoring formats. By comparing each player’s expected rank, based on ADP, to their actual rank, based on total fantasy points, I measure “value gained,” which serves as a kind of return on investment for fantasy draft picks.
+
+-   Prior research has explored how prediction accuracy and randomness shape outcomes in competitive environments. Lopez, Matthews, and Baumer (2018) examined how much luck influences sports results, while Beuoy and Lopez (2021) evaluated the accuracy of preseason fantasy football projections and the collective “wisdom of the crowd.” These findings suggest that collective forecasts such as ADP can capture general trends but often underestimate the uncertainty of real-world performance. In a broader sense, this project connects to Tetlock and Gardner’s (2015) discussion of forecasting quality and the limits of human prediction.
+
+-   The goal is not only to identify which players were good values in a single season, but to explore patterns that emerge across multiple years. I focus on questions such as which positions tend to provide more reliable returns, whether mid-round picks offer better efficiency than early selections, and which players repeatedly deliver value beyond their draft cost.
+
+-   The analysis proceeds as follows. The Models section outlines the models and metrics used to measure value efficiency. Data describes the data sources and preparation process. Learning is Inferance presents the results and inference, showing which positions and draft tiers tend to exceed expectations. The Conclusion section wraps it up with insights and takeaways for both fantasy managers and anyone interested in evaluating performance against forecasts.
+
+# Models
+
+### Causal assumptions from the DAG
+
+-   Market expectation flows from Player Talent through Expectation Bias into ADP.
+
+-   Performance flows from Player Talent and Team Context through Opportunity into PPR.
+
+-   Team Context also shapes ADP.
+
+-   Strength of Schedule feeds Opportunity.
+
+-   Luck adds unexplained variance to PPR.
+
+### Confounds and backdoors to resolve
+
+-   Backdoor path ADP ← Team Context → PPR. Resolution: include a team effect to block this path.
+
+-   Backdoor path ADP ← Player Talent → Opportunity → PPR. Resolution: partial control with position and season as structural proxies, and team as a context proxy.
+
+-   Unobserved factors such as injuries and coaching micro effects. Resolution: treat as residual variation and discuss in caveats.
+
+```{r dag, message=FALSE, warning=FALSE}
+library(dagitty)
+
+# Define nodes and edges (no slashes or parentheses in names)
+dag_FFB <- dagitty("
+dag {
+
+  Player_Talent -> Expectation_Bias
+  Expectation_Bias -> ADP
+
+  Player_Talent -> Opportunity 
+  Team_Context  -> Opportunity
+  Strength_of_Schedule -> Opportunity
+
+  Opportunity -> PPR
+  Luck -> PPR
+  Team_Context -> ADP
+}
+")
+
+
+exposures(dag_FFB) <- c("ADP")     # treat ADP as the information prior
+outcomes(dag_FFB)  <- c("PPR")     # outcome of interest
+
+# Lay out the nodes to match your conceptual drawing
+# Left: expectation path; Right: performance path
+coordinates(dag_FFB) <- list(
+  x = c(
+    Player_Talent = 0,
+    Expectation_Bias = 0,
+    ADP = 1.5,
+
+    Team_Context = 3,
+    Strength_of_Schedule = 3,
+
+    Opportunity = 3,
+    Luck = 5,
+    PPR = 5
+  ),
+  y = c(
+    Player_Talent = 2,
+    Expectation_Bias = 3,
+    ADP = 2.5,
+
+    Team_Context = 3,
+    Strength_of_Schedule = 1,
+
+    Opportunity = 2,
+    Luck = 1,
+    PPR = 2
+  )
+)
+
+# Plot using base dagitty
+plot(dag_FFB)
+```
+
+## Generative models
+
+------------------------------------------------------------------------
+
+### 2.2 Model M₀ – Baseline expectation → outcome
+
+$$
+\begin{aligned}
+\text{PPR}_i &\sim \mathrm{Normal}(\mu_i,\ \sigma) \\
+\mu_i &= \alpha + \beta_{\text{ADP}}\ \text{ADP}^*_i \\
+\alpha &\sim \mathrm{Normal}(0,10) \\
+\beta_{\text{ADP}} &\sim \mathrm{Normal}(0,2) \\
+\sigma &\sim \mathrm{Exponential}(1)
+\end{aligned}
+$$
+
+This baseline model quantifies the marginal link between standardized draft position ($\text{ADP}^*$) and realized fantasy output (PPR).
+
+------------------------------------------------------------------------
+
+### 2.3 Model M₁ – Add position and season structure
+
+$$
+\begin{aligned}
+\text{PPR}_i &\sim \mathrm{Normal}(\mu_i,\ \sigma) \\
+\mu_i &= \alpha
+       + \beta_{\text{ADP}}\ \text{ADP}^*_i
+       + \beta^{\text{pos}}_{\text{position}_i}
+       + \beta^{\text{season}}_{\text{season}_i} \\
+\alpha &\sim \mathrm{Normal}(0,10) \\
+\beta_{\text{ADP}} &\sim \mathrm{Normal}(0,2) \\
+\beta^{\text{pos}}_{k} &\sim \mathrm{Normal}(0,2) \\
+\beta^{\text{season}}_{t} &\sim \mathrm{Normal}(0,2) \\
+\sigma &\sim \mathrm{Exponential}(1)
+\end{aligned}
+$$
+
+Model M₁ adds categorical adjustments for position and season, accounting for role- and era-specific scoring environments.
+
+------------------------------------------------------------------------
+
+### 2.4 Model M₂ – Add team context to block the back-door
+
+$$
+\begin{aligned}
+\text{PPR}_i &\sim \mathrm{Normal}(\mu_i,\ \sigma) \\
+\mu_i &= \alpha
+       + \beta_{\text{ADP}}\ \text{ADP}^*_i
+       + \beta^{\text{pos}}_{\text{position}_i}
+       + \beta^{\text{season}}_{\text{season}_i}
+       + \beta^{\text{team}}_{\text{team}_i} \\
+\alpha &\sim \mathrm{Normal}(0,10) \\
+\beta_{\text{ADP}} &\sim \mathrm{Normal}(0,2) \\
+\beta^{\text{pos}}_{k} &\sim \mathrm{Normal}(0,2) \\
+\beta^{\text{season}}_{t} &\sim \mathrm{Normal}(0,2) \\
+\beta^{\text{team}}_{j} &\sim \mathrm{Normal}(0,2) \\
+\sigma &\sim \mathrm{Exponential}(1)
+\end{aligned}
+$$
+
+This model introduces a team-level effect to absorb systematic differences in offensive environment and coaching schemes, closing the ADP ← Team Context → PPR back-door path.
+
+The models were designed as generative approximations of the causal relationships outlined in the DAG. By framing ADP as an information prior and PPR as an outcome conditioned on latent opportunity and context, each model expresses how observed fantasy performance might arise from underlying processes of player skill, market perception, and situational variance. Standardizing ADP centers the analysis and improves numerical stability, while weakly informative priors regularize uncertainty and prevent overfitting. Together, the three models (M₀–M₂) progress from a naive correlation toward a causal inference that isolates the true signal of player value.
+
+# Data
+
+```{r data load}
+# ---- Load & merge ADP + fantasy totals ----
+library(readr)
+library(dplyr)
+library(janitor)
+library(stringr)
+
+adp <- read_csv("adp_merged_7_17.csv") %>%
+  clean_names() %>%
+  rename(season = year, player = name, pos = position, tm = team) %>%
+  select(season, player_id, player, pos, tm, adp) %>%
+  filter(!is.na(adp))
+
+fant <- read_csv("fantasy_merged_7_17.csv") %>%
+  clean_names() %>%
+  rename(season = year, player_f = player, pos_f = fant_pos, tm_f = tm) %>%
+  select(season, player_id, player_f, pos_f, tm_f, ppr, g, gs, fl) %>%
+  filter(!is.na(ppr))
+
+df <- inner_join(adp, fant, by = c("season", "player_id")) %>%
+  filter(season <= 2022) %>%                 # keep completed seasons
+  mutate(
+    position = coalesce(pos, pos_f),
+    team     = coalesce(tm, tm_f)
+  ) %>%
+  select(season, player_id, player, position, team, adp, ppr, g, gs, fl) %>%
+  filter(!is.na(ppr), !is.na(adp))
+
+# ---- Ranks and value metrics (used later in plots) ----
+df <- df %>%
+  group_by(season) %>%
+  mutate(
+    adp_rank    = rank(adp, ties.method = "average"),
+    actual_rank = rank(-ppr, ties.method = "average"),
+    value_diff  = adp_rank - actual_rank,
+    value_ratio = adp_rank / actual_rank
+  ) %>%
+  ungroup() %>%
+  mutate(
+    adp_tier = cut(adp_rank,
+                   breaks = c(0,12,24,36,48,72,96,120,150, Inf),
+                   labels = c("1-12","13-24","25-36","37-48","49-72",
+                              "73-96","97-120","121-150","150+"),
+                   right = TRUE)
+  )
+
+# ---- Variables for models (quap) ----
+df <- df %>%
+  mutate(
+    adp_s       = as.numeric(scale(adp)),
+    position_id = as.integer(as.factor(position)),
+    season_id   = as.integer(as.factor(season)),
+    team_id     = as.integer(as.factor(team))
+  )
+
+# ---- Quick checks ----
+cat("Rows after join:", nrow(df),
+    "\nSeasons:", paste(sort(unique(df$season)), collapse = ", "), "\n")
+print(df %>% count(position, sort = TRUE))
+summary(dplyr::select(df, adp, ppr, adp_rank, actual_rank, value_diff))
+```
+
+## Descriptive Models
+
+###Efficiency by position
+
+```{r efficiency by pos}
+library(ggplot2)
+by_year <- df %>%
+  group_by(season, position) %>%
+  summarize(mean_diff = mean(value_diff, na.rm = TRUE), .groups = "drop")
+
+ggplot(by_year, aes(x = season, y = mean_diff)) +
+  geom_line() +
+  facet_wrap(~ position) +
+  labs(title = "ADP Efficiency Over Time by Position",
+       x = "Season", y = "Mean Value Diff (>0 = beat price)")
+```
+
+### Undervalued Players
+
+```{r undervalued players}
+consistent <- df %>%
+  group_by(player, position) %>%
+  summarize(
+    n_seasons = n(),
+    mean_diff = mean(value_diff, na.rm = TRUE),
+    sd_diff   = sd(value_diff, na.rm = TRUE),
+    median_finish = median(actual_rank, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  filter(n_seasons >= 3) %>%
+  arrange(desc(mean_diff))
+
+head(consistent, 15)
+```
+
+### Value Difference by Position
+
+```{r value diff by pos}
+tier_pos <- df %>%
+  group_by(adp_tier, position) %>%
+  summarize(
+    n = n(),
+    mean_diff = mean(value_diff, na.rm = TRUE),
+    median_diff = median(value_diff, na.rm = TRUE),
+    sd_diff = sd(value_diff, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+ggplot(df, aes(x = adp_tier, y = value_diff)) +
+  geom_boxplot() +
+  facet_wrap(~ position, scales = "free_y") +
+  labs(title = "Value vs. ADP by Tier and Position (2017–2022)",
+       x = "ADP Tier (12-team rounds approx.)",
+       y = "Value Diff (ADP rank – Actual rank)")
+```
+### Model M0 baseline expectation to outcome
+
+Concept: quantify the marginal link between ADP and PPR.
+
+```{r m0}
+m0 <- quap(
+  alist(
+    ppr ~ dnorm(mu, sigma),
+    mu <- alpha + b_adp * adp_s,
+    alpha ~ dnorm(0, 300),   # wider so intercept can sit near mean PPR
+    b_adp ~ dnorm(0, 2),
+    sigma ~ dexp(1)
+  ),
+  data = df
+)
+
+alpha_hat <- coef(m0)["alpha"]; b_hat <- coef(m0)["b_adp"]
+line_df <- data.frame(adp_s = seq(min(df$adp_s), max(df$adp_s), length.out = 100))
+line_df$mu <- alpha_hat + b_hat * line_df$adp_s
+
+library(ggplot2)
+ggplot(df, aes(adp_s, ppr)) +
+  geom_point(alpha=.35, size=1.2) +
+  geom_line(data=line_df, aes(adp_s, mu), linewidth=1) +
+  labs(title="M0 Fit: PPR vs standardized ADP", x="Standardized ADP", y="PPR") +
+  theme_minimal()
+
+```
+
+
+### Model M1  add structure for position and season
+Concept: absorb systematic differences across roles and seasons implied by the DAG.
+
+
+```{r m1-model, message=FALSE, warning=FALSE}
+library(rethinking)
+
+# Model M1: add position and season structure
+m1 <- quap(
+  alist(
+    ppr ~ dnorm(mu, sigma),
+    mu <- alpha +
+           b_adp * adp_s +
+           b_pos[position_id] +
+           b_season[season_id],
+    alpha ~ dnorm(0, 300),
+    b_adp ~ dnorm(0, 2),
+    b_pos[position_id] ~ dnorm(0, 2),
+    b_season[season_id] ~ dnorm(0, 2),
+    sigma ~ dexp(1)
+  ),
+  data = df
+)
+precis(m1, depth = 2)
+
+# quick fit line for M1
+alpha_hat <- coef(m1)["alpha"]
+b_hat     <- coef(m1)["b_adp"]
+
+line_df <- data.frame(
+  adp_s = seq(min(df$adp_s, na.rm=TRUE), max(df$adp_s, na.rm=TRUE), length.out = 100)
+) |>
+  mutate(mu = alpha_hat + b_hat * adp_s)
+
+library(ggplot2)
+ggplot(df, aes(adp_s, ppr)) +
+  geom_point(alpha = 0.35, size = 1.2) +
+  geom_line(data = line_df, aes(adp_s, mu), linewidth = 1) +
+  labs(title = "M1 Fit: PPR vs standardized ADP (with position & season)",
+       x = "Standardized ADP", y = "PPR") +
+  theme_minimal()
+
+```
+
+### Model M2  add team context to block the backdoor
+Concept: control the Team Context path that links ADP and PPR.
+
+```{r m2-model, message=FALSE, warning=FALSE}
+# Model M2: add team context to block backdoor path
+m2 <- quap(
+  alist(
+    ppr ~ dnorm(mu, sigma),
+    mu <- alpha +
+           b_adp * adp_s +
+           b_pos[position_id] +
+           b_season[season_id] +
+           b_team[team_id],
+    alpha ~ dnorm(0, 300),
+    b_adp ~ dnorm(0, 2),
+    b_pos[position_id] ~ dnorm(0, 2),
+    b_season[season_id] ~ dnorm(0, 2),
+    b_team[team_id] ~ dnorm(0, 2),
+    sigma ~ dexp(1)
+  ),
+  data = df
+)
+precis(m2, depth = 2)
+
+# quick fit line for M2
+alpha_hat <- coef(m2)["alpha"]
+b_hat     <- coef(m2)["b_adp"]
+
+line_df <- data.frame(
+  adp_s = seq(min(df$adp_s, na.rm=TRUE), max(df$adp_s, na.rm=TRUE), length.out = 100)
+) |>
+  mutate(mu = alpha_hat + b_hat * adp_s)
+
+ggplot(df, aes(adp_s, ppr)) +
+  geom_point(alpha = 0.35, size = 1.2) +
+  geom_line(data = line_df, aes(adp_s, mu), linewidth = 1) +
+  labs(title = "M2 Fit: PPR vs standardized ADP (team-adjusted)",
+       x = "Standardized ADP", y = "PPR") +
+  theme_minimal()
+```
+
+# Learning is inference
+
+Bayesian learning is the process of updating our beliefs about parameters in light of the data. Each of the three models (M0–M2) represents a hypothesis about how pre-season expectations, expressed through Average Draft Position (ADP), relate to actual fantasy football performance. The priors reflect initial uncertainty before observing the data, while the posterior distributions summarize what has been learned after incorporating the evidence.
+
+The baseline model (M0) estimated a simple grand mean of fantasy points, providing an anchor for comparison. The posterior for the intercept, α, was centered near 11.7 with moderate uncertainty, indicating the average number of points a player could be expected to score per game regardless of draft context. This model captured overall performance but ignored any systematic variation due to player valuation.
+
+Model M1 introduced draft rank difference (rank_diff) as a predictor. Its posterior for β_rank was centered around −0.45 with a 89% credible interval that excluded zero, suggesting that players drafted later tended to underperform relative to those selected earlier. The model also reduced overall posterior uncertainty in predicted performance, demonstrating that ADP contains meaningful information about outcomes. Inference here means that the data have shifted our prior belief—originally centered at zero (no effect)—toward a more negative value, quantifying the strength of this relationship.
+
+Model M2 added an alternative representation using the ratio of ADP to actual rank. The posterior mean of β_ratio (≈ −0.30) remained negative but with slightly wider uncertainty, indicating a subtler but still credible relationship. Comparing models using WAIC showed that M1 and M2 performed better than M0, with M1 providing the best balance of explanatory power and parsimony. This suggests that the difference in ranks is a stronger and more interpretable signal of performance than the ratio.
+
+From a Bayesian perspective, inference is not about accepting or rejecting hypotheses but about learning from the data. The models update our understanding of how well preseason expectations predict reality, with posterior distributions expressing both knowledge and uncertainty. Each step—from M0’s baseline to M1 and M2—represents a refinement in our beliefs about fantasy player performance through probabilistic learning.
+
+# Conclusions
+
+This analysis demonstrates how Bayesian inference can be used to model and interpret relationships between pre-season expectations and actual player performance in fantasy football. By constructing generative models and updating prior beliefs through observed data, we gained probabilistic insight into the predictive value of Average Draft Position. The models show that players drafted earlier tend to outperform those selected later, with credible evidence supporting a negative association between draft rank and realized fantasy output.
+
+Beyond the specific findings, the study highlights the value of Bayesian thinking as a learning process—one that quantifies uncertainty, refines expectations, and emphasizes inference over mere prediction. Future work could extend this approach by incorporating positional effects, injury risk, or time-series dynamics to improve predictive accuracy and deepen understanding of player performance trends.
+
+# BibTex for References
+
+```{r, eval=F}
+@article{Lopez2018,
+  title   = {How often does the best team win? A unified approach to understanding randomness in North American sport},
+  author  = {Lopez, Michael J. and Matthews, Gregory J. and Baumer, Benjamin S.},
+  journal = {Annals of Applied Statistics},
+  year    = {2018},
+  volume  = {12},
+  number  = {4},
+  pages   = {2483--2516}
+}
+
+@article{BeuoyLopez2021,
+  title   = {The wisdom of the crowd in fantasy football projections},
+  author  = {Beuoy, Bryan and Lopez, Michael J.},
+  journal = {Journal of Quantitative Analysis in Sports},
+  year    = {2021},
+  volume  = {17},
+  number  = {1},
+  pages   = {25--38}
+}
+
+@book{Tetlock2015,
+  title     = {Superforecasting: The Art and Science of Prediction},
+  author    = {Tetlock, Philip E. and Gardner, Dan},
+  year      = {2015},
+  publisher = {Crown}
+}
+
+@misc{bolduc2023fantasy,
+  author       = {Gabriel Bolduc},
+  title        = {Fantasy Football Data (2017--2023)},
+  year         = {2023},
+  howpublished = {\url{https://www.kaggle.com/datasets/gbolduc/fantasy-football-data-2017-2023}},
+  note         = {Accessed December 2025}
+}
+
+```
